@@ -25,9 +25,11 @@ Fedora Linux, this can be done by running `ulimit -l <new-limit>` command, or
 to make it permanent, by creating a file at
 `/etc/security/limits.d/50-lockedmem.conf` with e.g. the following contents
 (1MiB should be enough for this package):
-	* - lockedmem 1048576
+  - - lockedmem 1048576
+
 logging out and logging back in.
 When you hit this limit, you'll get an error that looks like this:
+
 	error: failed to create an XDP socket: ebpf.NewMap qidconf_map failed: map create: operation not permitted
 
 Here is a minimal example of a program which receives network frames,
@@ -102,6 +104,8 @@ transmits them back out the same network link:
 package xdp
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"syscall"
@@ -232,7 +236,7 @@ func NewSocket(Ifindex int, QueueID int, options *SocketOptions) (xsk *Socket, e
 	xdpUmemReg := unix.XDPUmemReg{
 		Addr:     uint64(uintptr(unsafe.Pointer(&xsk.umem[0]))),
 		Len:      uint64(len(xsk.umem)),
-		Chunk_size:     uint32(options.FrameSize),
+		Size:     uint32(options.FrameSize),
 		Headroom: 0,
 	}
 
@@ -533,6 +537,61 @@ func (xsk *Socket) Poll(timeout int) (numReceived int, numCompleted int, err err
 	return
 }
 
+// PollCtx blocks until kernel informs us that it has either received
+// or completed (i.e. actually sent) some frames that were previously submitted
+// using Fill() or Transmit() methods - or until the context is cancelled.
+// The numReceived return value can be used as the argument for subsequent
+// Receive() method call.
+func (xsk *Socket) PollCtx(ctx context.Context) (numReceived int, numCompleted int, err error) {
+	var events int16
+	if xsk.numFilled > 0 {
+		events |= unix.POLLIN
+	}
+	if xsk.numTransmitted > 0 {
+		events |= unix.POLLOUT
+	}
+	if events == 0 {
+		return
+	}
+
+	cancelFd, err := unix.Eventfd(0, unix.EFD_NONBLOCK)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create eventfd: %v", err)
+	}
+
+	_ctx, _cancel := context.WithCancel(ctx)
+	defer _cancel()
+
+	var pfds [2]unix.PollFd
+	pfds[0].Fd = int32(xsk.fd)
+	pfds[0].Events = events
+	pfds[1].Fd = int32(cancelFd)
+	pfds[1].Events = unix.POLLIN
+
+	go func() {
+		<-_ctx.Done()
+		_, _ = unix.Write(cancelFd, []byte{1, 0, 0, 0, 0, 0, 0, 0})
+	}()
+
+	for err = unix.EINTR; errors.Is(err, unix.EINTR); {
+		_, err = unix.Poll(pfds[:], -1)
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if pfds[1].Revents&unix.POLLIN != 0 {
+		return 0, 0, context.Canceled
+	}
+
+	numReceived = xsk.NumReceived()
+	if numCompleted = xsk.NumCompleted(); numCompleted > 0 {
+		xsk.Complete(numCompleted)
+	}
+
+	return
+}
+
 // GetDescs returns up to n descriptors which are not currently in use.
 // if rx is true, return desc in first half of umem, 2nd half otherwise
 func (xsk *Socket) GetDescs(n int, rx bool) []Desc {
@@ -544,10 +603,6 @@ func (xsk *Socket) GetDescs(n int, rx bool) []Desc {
 			n = cap(xsk.getTXDescs)
 		}
 	}
-	// numOfUMEMChunks := len(xsk.freeRXDescs) / 2
-	// if n > numOfUMEMChunks {
-	// 	n = numOfUMEMChunks
-	// }
 
 	descs := xsk.getRXDescs[:0]
 	j := 0
