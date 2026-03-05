@@ -165,6 +165,10 @@ type SocketOptions struct {
 	CompletionRingNumDescs int
 	RxRingNumDescs         int
 	TxRingNumDescs         int
+	// SocketFlags are passed to bind(2). Set to unix.XDP_USE_SG to enable
+	// multi-buffer mode for receiving and transmitting jumbo frames.
+	// When zero, DefaultSocketFlags is used.
+	SocketFlags uint16
 }
 
 // Desc represents an XDP Rx/Tx descriptor.
@@ -374,8 +378,12 @@ func NewSocket(Ifindex int, QueueID int, options *SocketOptions) (xsk *Socket, e
 		sh.Cap = options.TxRingNumDescs
 	}
 
+	flags := options.SocketFlags
+	if flags == 0 {
+		flags = DefaultSocketFlags
+	}
 	sa := unix.SockaddrXDP{
-		Flags:   DefaultSocketFlags,
+		Flags:   flags,
 		Ifindex: uint32(Ifindex),
 		QueueID: uint32(QueueID),
 	}
@@ -444,6 +452,81 @@ func (xsk *Socket) Receive(num int) []Desc {
 	xsk.numFilled -= len(descs)
 
 	return descs
+}
+
+// ReceivePackets returns reassembled packets from the Rx ring. In multi-buffer
+// mode (XDP_USE_SG), a single packet may span multiple descriptors linked by
+// XDP_PKT_CONTD. This method concatenates such fragments into complete packets.
+// Each returned []byte is a complete packet. The underlying descriptor frames
+// are freed after copying.
+func (xsk *Socket) ReceivePackets(num int) [][]byte {
+	descs := xsk.Receive(num)
+	if len(descs) == 0 {
+		return nil
+	}
+
+	packets := make([][]byte, 0, len(descs))
+	var current []byte
+
+	for _, desc := range descs {
+		frame := xsk.GetFrame(desc)
+		if current == nil {
+			current = make([]byte, 0, desc.Len)
+		}
+		current = append(current, frame...)
+
+		if desc.Options&unix.XDP_PKT_CONTD == 0 {
+			// End of packet
+			packets = append(packets, current)
+			current = nil
+		}
+	}
+
+	// If there's leftover data with PKT_CONTD still set, the packet is
+	// incomplete (shouldn't happen in practice). Include it anyway.
+	if current != nil {
+		packets = append(packets, current)
+	}
+
+	return packets
+}
+
+// TransmitPacket splits a packet across multiple Tx descriptors if it exceeds
+// the frame size, setting XDP_PKT_CONTD on all but the last descriptor.
+// Returns the number of descriptors used, or 0 if there weren't enough free
+// TX slots.
+func (xsk *Socket) TransmitPacket(data []byte) int {
+	frameSize := xsk.options.FrameSize
+	numDescsNeeded := (len(data) + frameSize - 1) / frameSize
+	if numDescsNeeded == 0 {
+		return 0
+	}
+
+	txDescs := xsk.GetDescs(numDescsNeeded, false)
+	if len(txDescs) < numDescsNeeded {
+		return 0
+	}
+
+	for i := 0; i < numDescsNeeded; i++ {
+		start := i * frameSize
+		end := start + frameSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[start:end]
+
+		frame := xsk.umem[txDescs[i].Addr : txDescs[i].Addr+uint64(frameSize)]
+		copy(frame, chunk)
+		txDescs[i].Len = uint32(len(chunk))
+
+		if i < numDescsNeeded-1 {
+			txDescs[i].Options = unix.XDP_PKT_CONTD
+		} else {
+			txDescs[i].Options = 0
+		}
+	}
+
+	return xsk.Transmit(txDescs[:numDescsNeeded])
 }
 
 // Transmit submits the given descriptors to be sent out, it returns how many
